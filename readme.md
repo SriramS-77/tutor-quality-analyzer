@@ -1,131 +1,135 @@
-# AI Interaction History: Tutor Session Quality Analyzer
+# Tutor Session Quality Analyzer
 
-A condensed, chronological account of how the project was ideated and built with Claude (Claude Code / Sonnet) over
-roughly one evening. It is a curated summary, not a verbatim transcript. Personal details, tutor names and credentials
-are omitted. Hosting and deployment debugging is deliberately excluded.
+Assesses the quality of a recorded online class for children and classifies it as **weak / average / good / excellent**,
+with a confidence value and the observations behind the decision.
 
-## 1. Understanding the brief and choosing a strategy
+**Live app:** https://tutor-quality-analyzer--sriramsun.replit.app
 
-**Request:** "I have 2 recordings per class, an mp4 (1 hour) and a .vtt for each. What approach should I use?"
+Upload one `.mp4` recording. The server samples 5-minute segments, rates each with a Gemini multimodal model, and a
+random-forest classifier combines the segment results into a class for the whole lesson. Expect roughly 2 minutes of
+processing for the default 8 segments (the free Gemini tier is rate-limited).
 
-**What Claude advised**
-- With about 8 labelled recordings, nothing can be trained end to end. Use a **hybrid system**: measurable features from the
-  transcript, audio and video, plus an LLM scoring against a fixed rubric. Use the labelled samples to calibrate, not to train.
-- Check the data rules first: the brief restricts which services may process recordings of children. Prefer local
-  processing and send only transcript text (names stripped) to an LLM until the organisers confirm which APIs are allowed.
-- Study one excellent and one poor class first to see what actually differs.
-- Candidate signals: talk ratio, questions and wait time, student response length, silences, tech-trouble phrases, praise
-  and corrections. Warn that "more teacher talk is bad" is not automatically true, and that video quality or camera-on
-  rates can be misleading signals.
-- Plan: chunked rubric scoring with timestamped evidence, a calibrated final label, a simple Streamlit or Gradio app, and an
-  early deployment test.
-- Asked whether the VTT has speaker labels, since that decides how much work diarization would need.
+> **Reliability note.** This is a prototype trained on 8 labelled recordings. Held-out accuracy is about 50% on 8
+> whole-recording predictions (chance is 25%), which is not statistically distinguishable from luck, and a stricter
+> leave-one-recording-out test showed no evidence of signal. See [Results and limitations](#results-and-limitations).
+> Use the output as decision support, not as a verdict.
 
-## 2. Designing the experiment
+---
 
-**Request (paraphrased):** Write scripts that split the mp4 and vtt independently into chunks, extract features using
-free-tier Gemini Flash models (a cheap text model and a multimodal video model, with separate prompts per modality),
-then train a classifier such as a random forest on chunks. Features must be generic metrics, not recording-specific
-details like background colour, so they cannot be used to overfit after seeing a recording once. Run two executions:
-(A) train and test on separate recordings, (B) interleaved 70/30 or 80/20 chunk split, to detect overfitting. Folder
-layout: `class_recordings/<class>/`, with `weak` instead of `poor`, a `demo` folder to skip, and an open question about
-how to use the "known issues" recordings.
+## Methodology
 
-**Decisions made**
-- **Chunk size:** 5 minutes. Gives about 12 chunks per hour, is long enough to contain interaction, and short enough for
-  a free-tier call. A 45-second minimum keeps the closing segment where recap and homework occur.
-- **Label for known-issue recordings:** the feedback PDF gave per-recording comments grouped as excellent, good,
-  average, weak, and a separate "known quality issues" group with no grade. Those recordings are treated as **unlabeled**:
-  never trained or scored on, only predicted at the end as a qualitative check. The reviewers' text is not used as a feature,
-  since it would not exist for a new recording.
-- **Anti-overfitting feature design:** every feature is a bounded number with an anchored scale (0-4 ratings, counts, flags,
-  0-1 fractions). Prompts never reveal the label and never ask for an overall judgement. Only numeric fields reach the
-  classifier; the free-text evidence sentence is kept for explanations.
-- **Models:** left configurable through environment variables, because the exact free-tier model IDs were uncertain. A small
-  script lists the models a given key can call.
-- **Privacy:** speaker names replaced with `TUTOR` / `STUDENT_n` before sending transcripts; video cannot be anonymised, so
-  the free-tier data-use caveat was flagged for confirmation with the organisers.
-- **Two modalities, separate features:** transcript features plus deterministic transcript statistics (talk share,
-  silences, student turns); video features from a multimodal model that also hears the audio.
+### 1. Problem framing
+The brief gives a handful of recordings (an `.mp4` and a `.vtt` transcript per class) at four quality levels. Too few to
+train a model end to end, so the approach is **extract generic, behaviour-level measurements with an LLM, then fit a small,
+regularised classifier on them**.
 
-## 3. Building and smoke-testing the pipeline
+### 2. Chunking
+Each recording is split independently into 5-minute windows (a 45-second minimum keeps the short closing segment, where
+recap and homework usually happen):
+- **Video:** re-encoded to 360p, 1 fps, mono 16 kHz audio so uploads are small and cheap.
+- **Transcript:** cues are assigned by start time, and speaker names are replaced by `TUTOR` / `STUDENT_n`.
 
-Claude wrote `common.py`, `feature_spec.py`, `01_chunk.py`, `02_extract_features.py`, `03_train_eval.py`, then tested the
-parts that do not need an API key on synthetic recordings (fake VTTs, generated mp4s and fake cached model outputs).
+### 3. Feature extraction (separate prompt and model per modality)
+- **Text** (Gemini Flash-Lite plus deterministic transcript statistics): clarity, understanding checks, learner
+  participation, individual attention, warmth, feedback quality, pacing, classroom management, counts of questions /
+  praise / checks, and flags for greeting, learner introductions, recap and homework.
+- **Video** (Gemini Flash, which sees video and audio): tutor visibility and face clarity, lighting, stability, tidiness
+  of surroundings, audio clarity, noise, expressiveness, vocal energy, gestures, eye contact, visual aids, interactive
+  activities, learner engagement, tech disruption, speaking fractions.
 
-**Bugs found during testing and fixed**
-- An interrupted ffmpeg run left a partial chunk folder that a rerun would have treated as finished. Chunking now writes to
-  a temporary folder and renames it on completion.
-- A label column became floating point when unlabeled recordings were present, breaking classifier indexing. Fixed by
-  casting with a sentinel for unlabeled rows.
-- A synthetic check confirmed the overfit diagnostic behaves as intended: interleaved scores exceeded by-recording scores
-  when recordings had individual quirks.
+Design rules to stop the downstream model memorising one recording:
+- every feature is a bounded number (0-4 rating, count, flag or 0-1 fraction) with an **anchored scale**;
+- no feature refers to colours, names, subject or room details;
+- the prompt never reveals the class label and never asks for an overall quality verdict;
+- only the numeric fields reach the classifier. The free-text "evidence" sentence is for humans.
 
-Setup note: the first real run failed because `ffprobe` was not installed on Windows. The fix was installing ffmpeg via
-winget and restarting the terminal so the PATH refreshed.
+### 4. Classification
+Random forest (400 trees, depth 4, min leaf 3, balanced class weights), deliberately shallow because chunks are few and
+noisy. A logistic regression is used as a comparison. At inference, chunk probabilities are averaged over the lesson to
+give the class and confidence. The share of segments that agree with the final class is also shown.
 
-## 4. First real results and analysis
+### 5. Explanations
+Each feature's lesson average is compared with the training distribution, weighted by the forest's feature
+importance. This produces "what pushed the result up", "what pulled it down", and a segment-by-segment table with the
+vision model's observations. These describe the rated features, not the forest's exact internal decision path.
 
-Results showed by-recording scores near chance (chunk macro-F1 about 0.24-0.39, chance 0.25) and a large interleaved gap
-(about 0.25-0.30 for text and combined features). Claude's analysis:
-- By-recording is the honest setting; the interleaved numbers mostly reflect recognising recordings.
-- Recording-level Spearman values of 0.6-0.9 rested on only 4 recordings per fold and should not be quoted as evidence.
-- Feature importances were computed on a model fitted to all data, so they are not evidence either.
-- Chunk labels are noisy by construction, because the feedback is about whole-lesson behaviours.
+### 6. Evaluation (to check for overfitting)
+Two executions, run for text-only, video-only and combined features:
+- **By recording:** train on one recording per class, test on the remaining recordings. No recording appears on both sides.
+- **Interleaved:** pool all chunks and split 70/30 at random. Neighbouring chunks of the same recording land on both sides, so
+  this is optimistic. A large gap between the two executions means the model recognises recordings rather than quality.
+- **Leave-one-recording-out** (recording-level): train on 7, predict the 8th, with a label-permutation p-value.
 
-**Question:** should we add features that look important, or try XGBoost?
+Known-quality-issue recordings have no quality grade, so they are never used for training or scoring. They are
+predicted afterwards as a qualitative check.
 
-**Answer:** no to both. With 8 recordings the limit is data, not model capacity, and choosing features after seeing which
-ones score is selection leakage. Recommended recording-level aggregation, leave-one-recording-out validation, regression
-on the ordinal level, and a small feature list fixed in advance from the rubric.
+### Results and limitations
 
-## 5. Recording-level, leave-one-out validation
+| Setting (chunk-level macro-F1) | Text | Video | Both |
+|---|---|---|---|
+| By recording (no leakage) | ~0.24-0.28 | ~0.29-0.39 | ~0.28-0.30 |
+| Interleaved (leaky) | ~0.52-0.54 | ~0.44-0.46 | ~0.53-0.60 |
 
-Claude wrote `04_recording_level.py`: per-recording aggregates (means, with "any chunk" for flags), leave-one-recording-out
-predictions with equal-weight z-score, ridge and baseline models, a feature list fixed beforehand from the feedback themes,
-pairwise ordering accuracy, and a label-permutation p-value. Synthetic tests passed; a misleading baseline Spearman of -1
-(a leave-one-out artefact) was blanked out.
+- Chance is about 0.25. Text and combined models showed a large interleaved-vs-by-recording gap (about 0.25-0.30), a
+  clear sign of memorising recordings.
+- Video-only random forest had the smallest gap (about 0.07) and the best by-recording score, which is why it is the model
+  in the app. Its recording-level accuracy was 0.5 (4 of 8 predictions), which is not significant.
+- In leave-one-recording-out, no feature set beat chance (all permutation p-values 0.34 or higher; video concordance
+  0.21-0.29). Features do not yet separate the four grades reliably.
+- The video features did not register the known-issue recordings (tech disruption 0.0), partly because 360p at 1 fps hides
+  freezes.
+- Eight recordings can only detect very large effects, and the labels are subjective, whole-lesson judgements that
+  each 5-minute chunk only partly reflects.
 
-**Real results:** no feature set beat chance (all permutation p-values 0.34 or higher; negative correlations are
-expected under no signal with leave-one-out). One recording's score was an extreme outlier, showing instability. The
-known-issue recordings were not detected by the video features (tech disruption 0.0), likely because 360p at 1 fps hides
-freezes. Claude's conclusion: report it honestly as weak signal at n=8, and suggest the next real step: turn the
-reviewers' comments into per-item checklist labels and validate features against those (not built).
+**What would help most:** more labelled recordings, turning the reviewers' written feedback into per-item checklist labels
+(background, homework, rapport, introductions, energy, camera) and validating features against those, and scoring the
+whole recording directly against that checklist.
 
-## 6. Choosing the model for the app
+---
 
-**Request:** use the best video-only model (it did best on holdout) and build a simple single-page web app where a user
-uploads one mp4 and gets a class, confidence and reasons.
+## Run locally
 
-**Decisions**
-- Video-only random forest: best by-recording chunk score and smallest overfit gap among the options.
-- `05_export_model.py` retrains on all 8 labelled recordings, stores the model, training feature statistics and importances,
-  and records a holdout estimate, so the app can display honest reliability. It also writes a pinned `requirements.txt`
-  so the saved model loads with the same library versions.
-- App pipeline: cut evenly spaced 5-minute segments from the upload, extract features with the same model and prompt as
-  training, average chunk probabilities into the lesson-level class, then derive reasons by comparing feature averages with
-  the training data weighted by importance.
-- Used `imageio-ffmpeg` so the app needs no system ffmpeg, a slider to cap segments for free-tier quota, deletion of the
-  uploaded file after processing, and an on-page privacy and reliability notice.
-- Tested with the Gemini call stubbed and a headless Streamlit page load. A test model trained on synthetic data was deleted
-  before packaging so only a model built from real features is deployed.
+Requires Python 3.11+ and a Gemini API key. The research scripts need `ffmpeg` and `ffprobe` on PATH.
 
-**Question:** "What is the recording-level accuracy for this video-only model?"
+```bash
+pip install -r requirements.txt                  # root: google-genai pydantic pandas numpy scikit-learn scipy
+export GEMINI_API_KEY=...                        # PowerShell: $env:GEMINI_API_KEY="..."
+export DATA_DIR=/path/to/class_recordings        # folders: weak/ average/ good/ excellent/ (+ any unlabeled folder)
 
-**Honest answer:** 50% (4 of 8 whole-recording predictions, chance 25%), but the probability of 4 or more of 8 by
-guessing is about 11%, and the stricter leave-one-recording-out run showed video models at or below chance. The app
-footer reports the 50% figure; the recommendation was to show the leave-one-out result alongside it.
+python 00_list_models.py                         # which Gemini models your key can call
+export TEXT_MODEL=...; export VIDEO_MODEL=...    # optional overrides
 
-## 7. Outputs
+python 01_chunk.py                               # split mp4 / vtt into 5-min chunks
+python 02_extract_features.py                    # Gemini feature extraction (resumable, cached)
+python 03_train_eval.py                          # by-recording vs interleaved evaluation
+python 04_recording_level.py                     # leave-one-recording-out, permutation test
+python 05_export_model.py --video-model <model used in step 02>   # trains and exports the app model
+```
 
-`00_list_models.py`, `01_chunk.py`, `02_extract_features.py`, `03_train_eval.py`, `04_recording_level.py`,
-`05_export_model.py`, the `app/` Streamlit app, and this README and history.
+Run the web app:
 
-## Lessons and honest limits
+```bash
+cd app
+pip install -r requirements.txt                  # generated by step 05 with matching versions
+export GEMINI_API_KEY=...
+streamlit run app.py
+```
 
-- The approach was sound for exploration, but 8 recordings cannot support a reliable four-way classifier.
-- Claude repeatedly steered away from choices that would have inflated apparent performance (interleaved splits,
-  post-hoc feature selection, a heavier model), and surfaced weak results instead of tuning until they looked good.
-- Remaining work: more labelled recordings, checklist-based labels from the written feedback, higher frame rate for
-  detecting freezes, and confirming with the organisers that the Gemini API is permitted for these recordings.
-  
+Do not commit recordings, the `work/` folder, transcripts or API keys.
+
+## Repository layout
+
+| Path | Purpose |
+|---|---|
+| `common.py`, `feature_spec.py` | Shared config, VTT parsing and anonymisation, feature definitions and prompt rules |
+| `00_list_models.py` ... `05_export_model.py` | The research and export pipeline described above |
+| `app/app.py` | Streamlit single-page UI |
+| `app/pipeline.py` | Server-side: cut segments, Gemini features, random forest, explanations |
+| `app/model/video_rf.joblib` | Exported model bundle (no recording data) |
+
+## Data handling
+
+Recordings are confidential and contain children. Uploaded videos are processed on the server, sent to the Google
+Gemini API for analysis, and deleted afterwards. Free-tier Gemini data may be used by Google to improve its products, so
+confirm with the organisers that this service is permitted before processing any recording you are not entitled to share
+with it. Speaker names are stripped from transcripts before any LLM call, but video cannot be anonymised.
